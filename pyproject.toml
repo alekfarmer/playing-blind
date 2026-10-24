@@ -1,0 +1,19 @@
+[project]
+name = "playing-blind"
+version = "0.1.0"
+description = "CS221 Final Project: Playing Blind: A Hearts Card Game Agent"
+readme = "README.md"
+authors = [
+    { name = "Alek Farmer", email = "farmer.alek@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "open-spiel>=2.0.2",
+]
+
+[project.scripts]
+playing-blind = "playing_blind:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
