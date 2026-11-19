@@ -1,4 +1,9 @@
-from playing_blind.agents import Agent, RandomAgent, ConservativeAgent
+from playing_blind.agents import (
+    Agent,
+    RandomAgent,
+    ConservativeAgent,
+    FunctionApproximationQLearningAgent,
+)
 import pyspiel
 import random
 from collections import defaultdict
@@ -14,46 +19,48 @@ MAX_SCORE = 26
 NUM_TRICKS = 13
 
 
+class State:
+    def __init__(self, game) -> None:
+        self.pyspiel_state = game.new_initial_state()
+        self.cards_played = []
+        self.scores = [0, 0, 0, 0]
+        self.leading_suit = None
+        self.current_trick = []
+
+    def current_player(self):
+        return self.pyspiel_state.current_player()
+
+    def legal_actions(self):
+        return self.pyspiel_state.legal_actions()
+
+    def take_action(self, action):
+        player_num = self.pyspiel_state.current_player()
+        self.pyspiel_state.apply_action(action)
+        self.parse_trick(action, player_num)
+
+    def parse_trick(self, action, player_num):
+        def get_trick_winner(trick):
+            lead_suit = get_suit_of_card(trick[0])
+            leading_suit_cards = get_cards_of_suit(trick, lead_suit)
+            winner_index = trick.index(np.max(leading_suit_cards))
+            return (winner_index + player_num + 1) % NUM_PLAYERS
+
+        self.current_trick.append(action)
+        if len(self.current_trick) < NUM_PLAYERS:
+            if len(self.current_trick) == 1:
+                self.leading_suit = action % NUM_SUITS
+            return
+        trick_cards = copy(self.current_trick)
+        self.current_trick = []
+        self.cards_played.extend(trick_cards)
+        winner = get_trick_winner(trick_cards)
+        self.scores[winner] += get_points_in_trick(trick_cards)
+        # Check for shooting the moon
+        if len(self.cards_played) == 52 and MAX_SCORE in self.scores:
+            self.scores = [MAX_SCORE if s == 0 else 0 for s in self.scores]
+
+
 class Hearts:
-    class State:
-        def __init__(self, game) -> None:
-            self.pyspiel_state = game.new_initial_state()
-            self.tricks = []
-            self.scores = [0, 0, 0, 0]
-            self.leading_suit = None
-            self.current_trick = []
-
-        def take_action(self, action):
-            player_num = self.pyspiel_state.current_player()
-            self.pyspiel_state.apply_action(action)
-            self.parse_trick(action, player_num)
-
-        def parse_trick(self, action, player_num):
-            def get_trick_winner(trick):
-                lead_suit = trick[0] % NUM_SUITS
-                leading_suit_cards = get_suit(trick, lead_suit)
-                winner_index = trick.index(np.max(leading_suit_cards))
-                return (winner_index + player_num + 1) % NUM_PLAYERS
-
-            def get_points(trick):
-                points = len(get_suit(trick, HEARTS))
-                if Q_SPADES in trick:
-                    points += 13
-                return points
-
-            self.current_trick.append(action)
-            if len(self.current_trick) < NUM_PLAYERS:
-                if len(self.current_trick) == 1:
-                    self.leading_suit = action % NUM_SUITS
-                return
-            trick_cards = copy(self.current_trick)
-            self.current_trick = []
-            self.tricks.append(trick_cards)
-            winner = get_trick_winner(trick_cards)
-            self.scores[winner] += get_points(trick_cards)
-            # Check for shooting the moon
-            if len(self.tricks) == NUM_TRICKS and MAX_SCORE in self.scores:
-                self.scores = [MAX_SCORE if s == 0 else 0 for s in self.scores]
 
     def __init__(self, agents: list[Agent], seed=None, starting_index=None) -> None:
         self.seeded_random = random.Random(seed)
@@ -68,7 +75,7 @@ class Hearts:
             self.agents[player_num] = agent
 
         game = pyspiel.load_game("hearts", {"pass_cards": False})
-        self.state = self.State(game)
+        self.state = State(game)
         self.deal_hand()
 
     def deal_hand(self):
@@ -86,18 +93,18 @@ class Hearts:
         if DEBUGGING:
             print(self.state)
 
-    def play_hand(self):
+    def play_hand(self, training):
         while not self.state.pyspiel_state.is_terminal():
             player_num = self.state.pyspiel_state.current_player()
             agent = self.agents[player_num]
-            action = agent.choose_action(self.state)
+            action = agent.choose_action(self.state, training)
             if DEBUGGING:
                 print(
                     f"{self.state.pyspiel_state.action_to_string(player_num, action)}"
                 )
             self.state.take_action(action)
         for a in self.agents:
-            a.end_hand(self.state)
+            a.end_hand(self.state, training)
         if DEBUGGING:
             print(self.state)
             print("---------Hand Over---------")
@@ -128,7 +135,7 @@ class Hearts:
         return score_dict, winners
 
 
-def play_all_seats(agents, seed):
+def play_all_seats(agents, seed, training):
     mean_scores = {}
     mean_wins = {}
     for a in agents:
@@ -137,13 +144,63 @@ def play_all_seats(agents, seed):
 
     for i in range(NUM_PLAYERS):
         game = Hearts(agents, seed=seed, starting_index=i)
-        scores, winners = game.play_hand()
+        scores, winners = game.play_hand(training)
         for a in agents:
             mean_scores[a.name] += scores[a.name] / NUM_PLAYERS
         for winner in winners:
             mean_wins[winner] += 1 / (NUM_PLAYERS * len(winners))
 
     return mean_scores, mean_wins
+
+
+def evaluate(agents, num_training, num_eval, seed=0):
+    total_wins = defaultdict(list)
+    total_score = defaultdict(list)
+
+    for i in range(num_training):
+        if DEBUGGING:
+            print(f"-------Game {seed}--------")
+        scores, wins = play_all_seats(agents, 1_000_000 + seed + i, True)
+
+        for a in agents:
+            total_wins[a.name].append(wins[a.name])
+            total_score[a.name].append(scores[a.name])
+    if num_training > 0:
+        for a in agents:
+            print(f"{a.name:20}", end="| ")
+            mean = np.mean(total_wins[a.name])
+            std = np.std(total_wins[a.name], ddof=1)
+            ci = 1.96 * std / np.sqrt(num_training)
+            print(f"win %: {mean:.1%} | +/- {ci:.2%}", end="| ")
+
+            mean = np.mean(total_score[a.name])
+            std = np.std(total_score[a.name], ddof=1)
+            ci = 1.96 * std / np.sqrt(num_training)
+            print(f"score: {mean:.2f} | +/- {ci:.3f}")
+        print()
+
+    total_wins = defaultdict(list)
+    total_score = defaultdict(list)
+    for i in range(num_eval):
+        if DEBUGGING:
+            print(f"-------Game {seed}--------")
+        scores, wins = play_all_seats(agents, seed + i, False)
+
+        for a in agents:
+            total_wins[a.name].append(wins[a.name])
+            total_score[a.name].append(scores[a.name])
+
+    for a in agents:
+        print(f"{a.name:20}", end="| ")
+        mean = np.mean(total_wins[a.name])
+        std = np.std(total_wins[a.name], ddof=1)
+        ci = 1.96 * std / np.sqrt(num_eval)
+        print(f"win %: {mean:.1%} | +/- {ci:.2%}", end="| ")
+
+        mean = np.mean(total_score[a.name])
+        std = np.std(total_score[a.name], ddof=1)
+        ci = 1.96 * std / np.sqrt(num_eval)
+        print(f"score: {mean:.2f} | +/- {ci:.3f}")
 
 
 def baseline(num_iterations):
@@ -157,29 +214,21 @@ def baseline(num_iterations):
         RandomAgent2,
         RandomAgent3,
     ]
-    total_wins = defaultdict(list)
-    total_score = defaultdict(list)
+    evaluate(agents, 0, num_iterations)
 
-    for seed in range(num_iterations):
-        if DEBUGGING:
-            print(f"-------Game {seed}--------")
-        scores, wins = play_all_seats(agents, seed)
 
-        for a in agents:
-            total_wins[a.name].append(wins[a.name])
-            total_score[a.name].append(scores[a.name])
-
-    for a in agents:
-        print(f"{a.name:20}", end="| ")
-        mean = np.mean(total_wins[a.name])
-        std = np.std(total_wins[a.name], ddof=1)
-        ci = 1.96 * std / np.sqrt(num_iterations)
-        print(f"win %: {mean:.1%} | +/- {ci:.2%}", end="| ")
-
-        mean = np.mean(total_score[a.name])
-        std = np.std(total_score[a.name], ddof=1)
-        ci = 1.96 * std / np.sqrt(num_iterations)
-        print(f"score: {mean:.2f} | +/- {ci:.3f}")
+def q_learning():
+    QLearningAgent = FunctionApproximationQLearningAgent("QLearningAgent1", 2)
+    RandomAgent1 = RandomAgent("RandomAgent1", 1)
+    RandomAgent2 = RandomAgent("RandomAgent2", 2)
+    RandomAgent3 = RandomAgent("RandomAgent3", 3)
+    agents = [
+        QLearningAgent,
+        RandomAgent1,
+        RandomAgent2,
+        RandomAgent3,
+    ]
+    evaluate(agents, 3000, 800)
 
 
 if __name__ == "__main__":
@@ -191,3 +240,5 @@ if __name__ == "__main__":
     else:
         raise RuntimeError("Too many arguments")
     baseline(iterations)
+    print()
+    q_learning()
