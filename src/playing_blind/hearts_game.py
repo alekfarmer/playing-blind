@@ -3,14 +3,58 @@ import pyspiel
 import random
 from collections import defaultdict
 import numpy as np
+from copy import copy
+from playing_blind.cards import *
+import sys
 
 DEBUGGING = False
 NUM_PLAYERS = 4
 
 MAX_SCORE = 26
+NUM_TRICKS = 13
 
 
 class Hearts:
+    class State:
+        def __init__(self, game) -> None:
+            self.pyspiel_state = game.new_initial_state()
+            self.tricks = []
+            self.scores = [0, 0, 0, 0]
+            self.leading_suit = None
+            self.current_trick = []
+
+        def take_action(self, action):
+            player_num = self.pyspiel_state.current_player()
+            self.pyspiel_state.apply_action(action)
+            self.parse_trick(action, player_num)
+
+        def parse_trick(self, action, player_num):
+            def get_trick_winner(trick):
+                lead_suit = trick[0] % NUM_SUITS
+                leading_suit_cards = get_suit(trick, lead_suit)
+                winner_index = trick.index(np.max(leading_suit_cards))
+                return (winner_index + player_num + 1) % NUM_PLAYERS
+
+            def get_points(trick):
+                points = len(get_suit(trick, HEARTS))
+                if Q_SPADES in trick:
+                    points += 13
+                return points
+
+            self.current_trick.append(action)
+            if len(self.current_trick) < NUM_PLAYERS:
+                if len(self.current_trick) == 1:
+                    self.leading_suit = action % NUM_SUITS
+                return
+            trick_cards = copy(self.current_trick)
+            self.current_trick = []
+            self.tricks.append(trick_cards)
+            winner = get_trick_winner(trick_cards)
+            self.scores[winner] += get_points(trick_cards)
+            # Check for shooting the moon
+            if len(self.tricks) == NUM_TRICKS and MAX_SCORE in self.scores:
+                self.scores = [MAX_SCORE if s == 0 else 0 for s in self.scores]
+
     def __init__(self, agents: list[Agent], seed=None, starting_index=None) -> None:
         self.seeded_random = random.Random(seed)
         self.agents: list[Agent] = [Agent("") for _ in range(NUM_PLAYERS)]
@@ -23,36 +67,52 @@ class Hearts:
             agent.set_player_num(player_num)
             self.agents[player_num] = agent
 
-        self.game = pyspiel.load_game("hearts", {"pass_cards": False})
-        self.state = self.game.new_initial_state()
+        game = pyspiel.load_game("hearts", {"pass_cards": False})
+        self.state = self.State(game)
         self.deal_hand()
 
     def deal_hand(self):
-        while self.state.is_chance_node():
+        while self.state.pyspiel_state.is_chance_node():
             # AI-GENERATED (Claude): filter chance outcomes to legal actions and sample one
-            legal = set(self.state.legal_actions())
-            outcomes = [(a, p) for a, p in self.state.chance_outcomes() if a in legal]
+            legal = set(self.state.pyspiel_state.legal_actions())
+            outcomes = [
+                (a, p)
+                for a, p in self.state.pyspiel_state.chance_outcomes()
+                if a in legal
+            ]
             actions, probs = zip(*outcomes)
             action = self.seeded_random.choices(actions, weights=probs)[0]
-            self.state.apply_action(action)
+            self.state.pyspiel_state.apply_action(action)
         if DEBUGGING:
             print(self.state)
 
     def play_hand(self):
-        while not self.state.is_terminal():
-            player_num = self.state.current_player()
+        while not self.state.pyspiel_state.is_terminal():
+            player_num = self.state.pyspiel_state.current_player()
             agent = self.agents[player_num]
             action = agent.choose_action(self.state)
             if DEBUGGING:
-                print(f"{self.state.action_to_string(player_num, action)}")
-            self.state.apply_action(action)
+                print(
+                    f"{self.state.pyspiel_state.action_to_string(player_num, action)}"
+                )
+            self.state.take_action(action)
+        for a in self.agents:
+            a.end_hand(self.state)
         if DEBUGGING:
             print(self.state)
             print("---------Hand Over---------")
         score_dict = {}
         best_score = 0
         winners = []
-        for player_num, score in enumerate(self.state.returns()):
+        pyspiel_scores = self.state.pyspiel_state.returns()
+        for pyspiel_score, state_score in zip(pyspiel_scores, self.state.scores):
+            try:
+                assert (MAX_SCORE - pyspiel_score) == state_score
+            except AssertionError:
+                print(f"pyspiel: {MAX_SCORE - pyspiel_score} != {state_score}")
+                raise
+
+        for player_num, score in enumerate(pyspiel_scores):
             agent = self.agents[player_num]
             if DEBUGGING:
                 print(f"{agent.name}: {score}")
@@ -86,7 +146,7 @@ def play_all_seats(agents, seed):
     return mean_scores, mean_wins
 
 
-def baseline():
+def baseline(num_iterations):
     ConservativeAgent1 = ConservativeAgent("ConservativeAgent1")
     RandomAgent1 = RandomAgent("RandomAgent1", 1)
     RandomAgent2 = RandomAgent("RandomAgent2", 2)
@@ -99,8 +159,8 @@ def baseline():
     ]
     total_wins = defaultdict(list)
     total_score = defaultdict(list)
-    num_games = 10000
-    for seed in range(num_games):
+
+    for seed in range(num_iterations):
         if DEBUGGING:
             print(f"-------Game {seed}--------")
         scores, wins = play_all_seats(agents, seed)
@@ -113,14 +173,21 @@ def baseline():
         print(f"{a.name:20}", end="| ")
         mean = np.mean(total_wins[a.name])
         std = np.std(total_wins[a.name], ddof=1)
-        ci = 1.96 * std / np.sqrt(num_games)
-        print(f"win %: {mean:.1%} | +/- {ci:.4%}", end="| ")
+        ci = 1.96 * std / np.sqrt(num_iterations)
+        print(f"win %: {mean:.1%} | +/- {ci:.2%}", end="| ")
 
         mean = np.mean(total_score[a.name])
         std = np.std(total_score[a.name], ddof=1)
-        ci = 1.96 * std / np.sqrt(num_games)
-        print(f"score: {mean:.2f} | +/- {ci:.4f}")
+        ci = 1.96 * std / np.sqrt(num_iterations)
+        print(f"score: {mean:.2f} | +/- {ci:.3f}")
 
 
 if __name__ == "__main__":
-    baseline()
+    iterations = 100
+    if len(sys.argv) < 2:
+        iterations = 100
+    elif len(sys.argv) == 2:
+        iterations = int(sys.argv[1])
+    else:
+        raise RuntimeError("Too many arguments")
+    baseline(iterations)
